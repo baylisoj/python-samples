@@ -3,3 +3,4 @@ pyarrow>=6.0.0
 numpy>=1.19
 Faker>=13.0.0
 jupytext==1.18.1
+lunr
