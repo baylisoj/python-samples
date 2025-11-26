@@ -19,8 +19,10 @@ client = openai.AzureOpenAI(
 )
 MODEL_NAME = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT"]
 
+csv_path = os.path.join(os.path.dirname(__file__), "data", "exposures.csv")
+
 # Index the data from the CSV
-with open(".\data\exposures.csv") as file:
+with open(csv_path) as file:
     reader = csv.reader(file)
     rows = list(reader)
 documents = [{"id": (i + 1), "body": " ".join(row)} for i, row in enumerate(rows[1:])]
