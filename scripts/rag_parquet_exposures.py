@@ -18,18 +18,23 @@ client = openai.AzureOpenAI(
 )
 MODEL_NAME = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT"]
 
-# Connect to DuckDB and load parquet file metadata
-con = duckdb.connect()
+# Parquet file path
 parquet_path = os.path.join(os.path.dirname(__file__), "data", "exposures.parquet")
-record_count = con.execute(f"SELECT COUNT(*) FROM '{parquet_path}'").fetchone()[0]
-schema_info = con.execute(f"DESCRIBE SELECT * FROM '{parquet_path}'").df()
-columns = schema_info['column_name'].tolist()
-column_types = schema_info[['column_name', 'column_type']].to_dict('records')
-print(f"Loaded {record_count} exposure records from parquet file")
-print(f"Columns: {', '.join(columns)}")
 
-# Schema description for SQL generation
-SCHEMA_DESCRIPTION = f"""
+
+def get_schema_info():
+    """Load parquet file metadata and return schema information."""
+    with duckdb.connect() as con:
+        record_count = con.execute(f"SELECT COUNT(*) FROM '{parquet_path}'").fetchone()[0]
+        schema_info = con.execute(f"DESCRIBE SELECT * FROM '{parquet_path}'").df()
+        columns = schema_info['column_name'].tolist()
+        column_types = schema_info[['column_name', 'column_type']].to_dict('records')
+    return record_count, columns, column_types
+
+def get_schema_description():
+    """Generate schema description for SQL generation."""
+    _, _, column_types = get_schema_info()
+    return f"""
 Database Schema:
 Table: exposures (stored in parquet file at '{parquet_path}')
 Columns:
@@ -75,10 +80,12 @@ def get_response_for_chatbot(user_question: str, conversation_history: list = No
     if conversation_history is None:
         conversation_history = []
     
+    schema_description = get_schema_description()
+    
     # Use Azure OpenAI to convert natural language to SQL
     sql_generation_prompt = f"""You are a SQL expert. Convert the user's natural language question into a DuckDB SQL query.
 
-{SCHEMA_DESCRIPTION}
+{schema_description}
 
 Important rules:
 1. Use the exact path '{parquet_path}' in the FROM clause
@@ -106,32 +113,36 @@ SQL Query:"""
 
         search_query = sql_response.choices[0].message.content.strip()
         # Clean up any markdown code blocks
-        search_query = search_query.replace(
-            "```sql", "").replace("```", "").strip()
+        search_query = search_query.replace("```sql", "").replace("```", "").strip()
 
-        # Execute the generated SQL query
-        matching_df = con.execute(search_query).df()
+        # Execute the generated SQL query with its own connection
+        with duckdb.connect() as con:
+            matching_df = con.execute(search_query).df()
 
     except Exception:
-        # Fallback to simple keyword search
+        # Fallback to simple keyword search using parameterized query
         search_query = f"""
         SELECT *
         FROM '{parquet_path}'
         WHERE 
-            CAST(vesselId AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(vessel AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(operator AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(year AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(type AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(value AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(tonnage AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(length AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(cargoType AS VARCHAR) ILIKE '%{user_question}%' OR
-            CAST(premium AS VARCHAR) ILIKE '%{user_question}%'
+            CAST(vesselId AS VARCHAR) ILIKE ? OR
+            CAST(vessel AS VARCHAR) ILIKE ? OR
+            CAST(operator AS VARCHAR) ILIKE ? OR
+            CAST(year AS VARCHAR) ILIKE ? OR
+            CAST(type AS VARCHAR) ILIKE ? OR
+            CAST(value AS VARCHAR) ILIKE ? OR
+            CAST(tonnage AS VARCHAR) ILIKE ? OR
+            CAST(length AS VARCHAR) ILIKE ? OR
+            CAST(cargoType AS VARCHAR) ILIKE ? OR
+            CAST(premium AS VARCHAR) ILIKE ?
         LIMIT 10
         """
+        # Create parameter list with wildcards for ILIKE pattern matching
+        search_pattern = f'%{user_question}%'
+        params = [search_pattern] * 10  # One parameter for each column
         try:
-            matching_df = con.execute(search_query).df()
+            with duckdb.connect() as con:
+                matching_df = con.execute(search_query, params).df()
         except Exception as fallback_error:
             return {
                 "messages": conversation_history + [
@@ -188,6 +199,11 @@ SQL Query:"""
 
 # Example CLI interface (can be removed when integrating with a chatbot)
 if __name__ == "__main__":
+    # Display initial schema information
+    record_count, columns, _ = get_schema_info()
+    print(f"Loaded {record_count} exposure records from parquet file")
+    print(f"Columns: {', '.join(columns)}")
+    
     # Maintain conversation history across the session
     conversation_history = []
 
@@ -221,6 +237,3 @@ if __name__ == "__main__":
             print(result["messages"][-1]["content"])
         else:
             print(f"\nError: {result['error']}")
-
-    # Close DuckDB connection
-    con.close()
