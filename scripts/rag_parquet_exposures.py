@@ -176,9 +176,11 @@ SQL Query:"""
     assistant_response = response.choices[0].message.content
 
     # Build the complete message history
-    # Only add system message if this is the first turn (empty history)
-    if not conversation_history:
+    # Always ensure system message is at the start
+    if not conversation_history or conversation_history[0].get("role") != "system":
         messages = [{"role": "system", "content": SYSTEM_MESSAGE}]
+        if conversation_history:
+            messages.extend(conversation_history)
     else:
         messages = conversation_history.copy()
 
