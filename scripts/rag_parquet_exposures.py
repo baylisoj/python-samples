@@ -8,6 +8,15 @@ from dotenv import load_dotenv
 # Setup the Azure OpenAI client
 load_dotenv(override=True)
 
+# Validate required environment variables
+required_env_vars = ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_CHAT_DEPLOYMENT"]
+missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
+if missing_vars:
+    raise ValueError(
+        f"Missing required environment variables: {', '.join(missing_vars)}. "
+        f"Please set them in your .env file or environment."
+    )
+
 token_provider = azure.identity.get_bearer_token_provider(
     azure.identity.DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
 )
