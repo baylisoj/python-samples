@@ -69,6 +69,153 @@ You must use the data set to answer the questions, you should not provide any in
 """
 
 
+def generate_sql_from_question(user_question: str, schema_description: str) -> str:
+    """
+    Convert a natural language question into a SQL query using Azure OpenAI.
+    
+    Args:
+        user_question: The user's natural language question
+        schema_description: Description of the database schema
+    
+    Returns:
+        str: Generated SQL query
+    """
+    sql_generation_prompt = f"""You are a SQL expert. Convert the user's natural language question into a DuckDB SQL query.
+
+{schema_description}
+
+Important rules:
+1. Use the exact path '{parquet_path}' in the FROM clause
+2. Return ONLY the SQL query, no explanations or markdown
+3. Limit results to 10 rows unless the user asks for specific aggregations
+4. Use ILIKE for case-insensitive text matching
+5. For "highest", "largest", "most" use ORDER BY DESC
+6. For "lowest", "smallest", "least" use ORDER BY ASC
+7. Always use proper SQL syntax for DuckDB
+
+User question: {user_question}
+
+SQL Query:"""
+
+    sql_response = client.chat.completions.create(
+        model=MODEL_NAME,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": "You are a SQL expert that converts natural language to DuckDB SQL queries. Return only the SQL query without markdown formatting or explanations."},
+            {"role": "user", "content": sql_generation_prompt}
+        ]
+    )
+
+    search_query = sql_response.choices[0].message.content.strip()
+    # Clean up any markdown code blocks
+    return search_query.replace("```sql", "").replace("```", "").strip()
+
+
+def execute_sql_query(sql_query: str) -> tuple[str, object]:
+    """
+    Execute a SQL query against the parquet file.
+    
+    Args:
+        sql_query: SQL query to execute
+    
+    Returns:
+        tuple: (executed_query, dataframe) - query that was executed and the result dataframe
+    
+    Raises:
+        Exception: If query execution fails
+    """
+    with duckdb.connect() as con:
+        return sql_query, con.execute(sql_query).df()
+
+
+def execute_fallback_search(user_question: str) -> tuple[str, object]:
+    """
+    Execute a fallback keyword search when SQL generation fails.
+    
+    Args:
+        user_question: The user's question to search for
+    
+    Returns:
+        tuple: (executed_query, dataframe) - query that was executed and the result dataframe
+    
+    Raises:
+        Exception: If fallback search execution fails
+    """
+    search_query = f"""
+    SELECT *
+    FROM '{parquet_path}'
+    WHERE 
+        CAST(vesselId AS VARCHAR) ILIKE ? OR
+        CAST(vessel AS VARCHAR) ILIKE ? OR
+        CAST(operator AS VARCHAR) ILIKE ? OR
+        CAST(year AS VARCHAR) ILIKE ? OR
+        CAST(type AS VARCHAR) ILIKE ? OR
+        CAST(value AS VARCHAR) ILIKE ? OR
+        CAST(tonnage AS VARCHAR) ILIKE ? OR
+        CAST(length AS VARCHAR) ILIKE ? OR
+        CAST(cargoType AS VARCHAR) ILIKE ? OR
+        CAST(premium AS VARCHAR) ILIKE ?
+    LIMIT 10
+    """
+    # Create parameter list with wildcards for ILIKE pattern matching
+    search_pattern = f'%{user_question}%'
+    params = [search_pattern] * 10  # One parameter for each column
+    
+    with duckdb.connect() as con:
+        return search_query, con.execute(search_query, params).df()
+
+
+def generate_response_from_data(user_question: str, matches_table: str) -> str:
+    """
+    Generate a natural language response based on query results using Azure OpenAI.
+    
+    Args:
+        user_question: The user's original question
+        matches_table: Markdown table of matching records
+    
+    Returns:
+        str: Generated response from the AI
+    """
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": SYSTEM_MESSAGE},
+            {"role": "user", "content": f"{user_question}\nSources: {matches_table}"},
+        ],
+    )
+    return response.choices[0].message.content
+
+
+def build_message_history(conversation_history: list, user_question: str, assistant_response: str) -> list:
+    """
+    Build the complete message history ensuring system message is always present.
+    
+    Args:
+        conversation_history: Existing conversation history
+        user_question: The user's current question
+        assistant_response: The assistant's response
+    
+    Returns:
+        list: Complete message history with system message, conversation, and new messages
+    """
+    # Always ensure system message is at the start
+    if not conversation_history or conversation_history[0].get("role") != "system":
+        messages = [{"role": "system", "content": SYSTEM_MESSAGE}]
+        if conversation_history:
+            messages.extend(conversation_history)
+    else:
+        messages = conversation_history.copy()
+
+    # Append the new user and assistant messages
+    messages.extend([
+        {"role": "user", "content": user_question},
+        {"role": "assistant", "content": assistant_response}
+    ])
+    
+    return messages
+
+
 def get_response_for_chatbot(user_question: str, conversation_history: list = None) -> dict:
     """
     Process a user question and return structured message data for chatbot integration.
@@ -91,113 +238,36 @@ def get_response_for_chatbot(user_question: str, conversation_history: list = No
     
     schema_description = get_schema_description()
     
-    # Use Azure OpenAI to convert natural language to SQL
-    sql_generation_prompt = f"""You are a SQL expert. Convert the user's natural language question into a DuckDB SQL query.
-
-{schema_description}
-
-Important rules:
-1. Use the exact path '{parquet_path}' in the FROM clause
-2. Return ONLY the SQL query, no explanations or markdown
-3. Limit results to 10 rows unless the user asks for specific aggregations
-4. Use ILIKE for case-insensitive text matching
-5. For "highest", "largest", "most" use ORDER BY DESC
-6. For "lowest", "smallest", "least" use ORDER BY ASC
-7. Always use proper SQL syntax for DuckDB
-
-User question: {user_question}
-
-SQL Query:"""
-
+    # Try to generate and execute SQL query
     try:
-        # Generate SQL from natural language
-        sql_response = client.chat.completions.create(
-            model=MODEL_NAME,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": "You are a SQL expert that converts natural language to DuckDB SQL queries. Return only the SQL query without markdown formatting or explanations."},
-                {"role": "user", "content": sql_generation_prompt}
-            ]
-        )
-
-        search_query = sql_response.choices[0].message.content.strip()
-        # Clean up any markdown code blocks
-        search_query = search_query.replace("```sql", "").replace("```", "").strip()
-
-        # Execute the generated SQL query with its own connection
-        with duckdb.connect() as con:
-            matching_df = con.execute(search_query).df()
-
+        search_query = generate_sql_from_question(user_question, schema_description)
+        search_query, matching_df = execute_sql_query(search_query)
     except Exception:
-        # Fallback to simple keyword search using parameterized query
-        search_query = f"""
-        SELECT *
-        FROM '{parquet_path}'
-        WHERE 
-            CAST(vesselId AS VARCHAR) ILIKE ? OR
-            CAST(vessel AS VARCHAR) ILIKE ? OR
-            CAST(operator AS VARCHAR) ILIKE ? OR
-            CAST(year AS VARCHAR) ILIKE ? OR
-            CAST(type AS VARCHAR) ILIKE ? OR
-            CAST(value AS VARCHAR) ILIKE ? OR
-            CAST(tonnage AS VARCHAR) ILIKE ? OR
-            CAST(length AS VARCHAR) ILIKE ? OR
-            CAST(cargoType AS VARCHAR) ILIKE ? OR
-            CAST(premium AS VARCHAR) ILIKE ?
-        LIMIT 10
-        """
-        # Create parameter list with wildcards for ILIKE pattern matching
-        search_pattern = f'%{user_question}%'
-        params = [search_pattern] * 10  # One parameter for each column
+        # Fallback to keyword search if SQL generation or execution fails
         try:
-            with duckdb.connect() as con:
-                matching_df = con.execute(search_query, params).df()
+            search_query, matching_df = execute_fallback_search(user_question)
         except Exception as fallback_error:
+            # Return error response if both methods fail
             return {
-                "messages": conversation_history + [
-                    {"role": "system", "content": SYSTEM_MESSAGE},
-                    {"role": "user", "content": user_question},
-                    {"role": "assistant",
-                        "content": f"I encountered an error processing your question: {str(fallback_error)}"}
-                ],
-                "sql_query": search_query,
+                "messages": build_message_history(
+                    conversation_history,
+                    user_question,
+                    f"I encountered an error processing your question: {str(fallback_error)}"
+                ),
+                "sql_query": None,
                 "data": None,
                 "success": False,
                 "error": str(fallback_error)
             }
     
-    # Format as a markdown table
-    if len(matching_df) > 0:
-        matches_table = matching_df.to_markdown(index=False)
-    else:
-        matches_table = "No matching records found."
+    # Format results as markdown table
+    matches_table = matching_df.to_markdown(index=False) if len(matching_df) > 0 else "No matching records found."
     
-    # Generate the final response using the data
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        temperature=0.3,
-        messages=[
-            {"role": "system", "content": SYSTEM_MESSAGE},
-            {"role": "user", "content": f"{user_question}\nSources: {matches_table}"},
-        ],
-    )
+    # Generate natural language response from the data
+    assistant_response = generate_response_from_data(user_question, matches_table)
     
-    assistant_response = response.choices[0].message.content
-
-    # Build the complete message history
-    # Always ensure system message is at the start
-    if not conversation_history or conversation_history[0].get("role") != "system":
-        messages = [{"role": "system", "content": SYSTEM_MESSAGE}]
-        if conversation_history:
-            messages.extend(conversation_history)
-    else:
-        messages = conversation_history.copy()
-
-    # Append the new user and assistant messages
-    messages.extend([
-        {"role": "user", "content": user_question},
-        {"role": "assistant", "content": assistant_response}
-    ])
+    # Build complete message history
+    messages = build_message_history(conversation_history, user_question, assistant_response)
 
     return {
         "messages": messages,
