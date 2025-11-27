@@ -54,17 +54,26 @@ You are a helpful assistant that answers questions about vessel insurance exposu
 You must use the data set to answer the questions, you should not provide any info that is not in the provided sources.
 """
 
-# Loop to handle multiple questions
-while True:
-    # Get the user question
-    user_question = input("\nEnter your question about vessel insurance exposures (or 'quit' to exit): ")
+
+def get_response_for_chatbot(user_question: str, conversation_history: list = None) -> dict:
+    """
+    Process a user question and return structured message data for chatbot integration.
     
-    if user_question.lower() in ['quit', 'exit', 'q']:
-        print("Goodbye!")
-        break
+    Args:
+        user_question: The user's question about vessel insurance exposures
+        conversation_history: Optional list of previous messages in the format:
+                             [{"role": "user|assistant|system", "content": "..."}]
     
-    if not user_question.strip():
-        continue
+    Returns:
+        dict with keys:
+            - "messages": list of all messages including system, user, and assistant responses
+            - "sql_query": the generated SQL query (for debugging/logging)
+            - "data": the raw dataframe as dict (for programmatic access)
+            - "success": boolean indicating if the query was successful
+            - "error": error message if success is False
+    """
+    if conversation_history is None:
+        conversation_history = []
     
     # Use Azure OpenAI to convert natural language to SQL
     sql_generation_prompt = f"""You are a SQL expert. Convert the user's natural language question into a DuckDB SQL query.
@@ -100,14 +109,10 @@ SQL Query:"""
         search_query = search_query.replace(
             "```sql", "").replace("```", "").strip()
 
-        print(f"\nGenerated SQL Query:\n{search_query}\n")
-
         # Execute the generated SQL query
         matching_df = con.execute(search_query).df()
-    except Exception as e:
-        print(f"\nError executing query: {e}")
-        print("Falling back to keyword search...\n")
 
+    except Exception:
         # Fallback to simple keyword search
         search_query = f"""
         SELECT *
@@ -125,7 +130,21 @@ SQL Query:"""
             CAST(premium AS VARCHAR) ILIKE '%{user_question}%'
         LIMIT 10
         """
-        matching_df = con.execute(search_query).df()
+        try:
+            matching_df = con.execute(search_query).df()
+        except Exception as fallback_error:
+            return {
+                "messages": conversation_history + [
+                    {"role": "system", "content": SYSTEM_MESSAGE},
+                    {"role": "user", "content": user_question},
+                    {"role": "assistant",
+                        "content": f"I encountered an error processing your question: {str(fallback_error)}"}
+                ],
+                "sql_query": search_query,
+                "data": None,
+                "success": False,
+                "error": str(fallback_error)
+            }
     
     # Format as a markdown table
     if len(matching_df) > 0:
@@ -133,10 +152,7 @@ SQL Query:"""
     else:
         matches_table = "No matching records found."
     
-    print("\nFound matches:")
-    print(matches_table)
-    
-    # Now we can use the matches to generate a response
+    # Generate the final response using the data
     response = client.chat.completions.create(
         model=MODEL_NAME,
         temperature=0.3,
@@ -146,8 +162,65 @@ SQL Query:"""
         ],
     )
     
-    print("\nResponse from Azure OpenAI:\n")
-    print(response.choices[0].message.content)
+    assistant_response = response.choices[0].message.content
 
-# Close DuckDB connection
-con.close()
+    # Build the complete message history
+    # Only add system message if this is the first turn (empty history)
+    if not conversation_history:
+        messages = [{"role": "system", "content": SYSTEM_MESSAGE}]
+    else:
+        messages = conversation_history.copy()
+
+    # Append the new user and assistant messages
+    messages.extend([
+        {"role": "user", "content": user_question},
+        {"role": "assistant", "content": assistant_response}
+    ])
+
+    return {
+        "messages": messages,
+        "sql_query": search_query,
+        "data": matching_df.to_dict('records') if len(matching_df) > 0 else [],
+        "success": True,
+        "error": None
+    }
+
+
+# Example CLI interface (can be removed when integrating with a chatbot)
+if __name__ == "__main__":
+    # Maintain conversation history across the session
+    conversation_history = []
+
+    # Loop to handle multiple questions
+    while True:
+        # Get the user question
+        user_question = input(
+            "\nEnter your question about vessel insurance exposures (or 'quit' to exit): ")
+
+        if user_question.lower() in ['quit', 'exit', 'q']:
+            print("Goodbye!")
+            break
+
+        if not user_question.strip():
+            continue
+
+        # Call the chatbot function with conversation history
+        result = get_response_for_chatbot(user_question, conversation_history)
+
+        # Update the conversation history for the next turn
+        conversation_history = result["messages"]
+
+        print("\n--- Result ---")
+        print(f"Total messages in history: {len(conversation_history)}")
+
+        # Display results
+        if result["success"]:
+            print(f"\nGenerated SQL Query:\n{result['sql_query']}\n")
+            print(f"Found {len(result['data'])} records\n")
+            print("Response from Azure OpenAI:\n")
+            print(result["messages"][-1]["content"])
+        else:
+            print(f"\nError: {result['error']}")
+
+    # Close DuckDB connection
+    con.close()
